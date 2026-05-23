@@ -1,0 +1,288 @@
+name: CloudRun CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - prod
+    paths:
+      - 'app/**'
+      - 'terraform/**'
+      - '.github/workflows/cloudrun_deploy.yml'
+  pull_request:
+    branches:
+      - main
+      - prod
+    paths:
+      - 'app/**'
+      - 'terraform/**'
+      - 'terraform/databases.yml'
+      - '.github/workflows/cloudrun_deploy.yml'
+  workflow_dispatch:
+
+env:
+  TF_VERSION: '1.7.0'
+  TF_WORKING_DIR: './terraform'
+  GCP_REGION: 'us-central1'
+  EMAIL_FROM: ${{ secrets.SMTP_USER }}"
+
+concurrency:
+  group: cloud-run-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker gcr.io --quiet
+
+      - name: Build and push image
+        id: image
+        run: |
+          IMAGE="gcr.io/${{ secrets.GCP_PROJECT_ID }}/breaks-app:${{ github.sha }}"
+          docker build -t "$IMAGE" -t "gcr.io/${{ secrets.GCP_PROJECT_ID }}/breaks-app:latest" ./app
+          docker push "$IMAGE"
+          docker push "gcr.io/${{ secrets.GCP_PROJECT_ID }}/breaks-app:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: build
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Load database config
+        run: |
+          TF_VAR_databases=$(python3 -c "
+          import yaml, json
+          with open('databases.yml') as f:
+              data = yaml.safe_load(f)
+          print(json.dumps(data.get('databases') or {}))
+          ")
+          echo "TF_VAR_databases=$TF_VAR_databases" >> $GITHUB_ENV
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Import pre-existing resources
+        # Idempotent — exits 0 whether resource is newly imported or already in state.
+        # Needed because breaks_main was created manually before Terraform managed it.
+        run: |
+          terraform import \
+            -var="gcp_project_id=${{ secrets.GCP_PROJECT_ID }}" \
+            -var="gcp_region=${{ env.GCP_REGION }}" \
+            -var="jwt_secret=${{ secrets.JWT_SECRET }}" \
+            -var="smtp_host=${{ secrets.SMTP_HOST }}" \
+            -var="smtp_user=${{ secrets.SMTP_USER }}" \
+            -var="smtp_pass=${{ secrets.SMTP_PASS }}" \
+            -var="email_from=${{ secrets.SMTP_USER }}" \
+            -var="github_app_private_key_b64=${{ secrets.GH_APP_PRIVATE_KEY_B64 }}" \
+            -var="internal_api_secret=${{ secrets.INTERNAL_API_SECRET }}" \
+            -var="cloud_run_image=gcr.io/${{ secrets.GCP_PROJECT_ID }}/breaks-app:${{ github.sha }}" \
+            google_sql_database.main_db \
+            "projects/${{ secrets.GCP_PROJECT_ID }}/instances/breaks-postgres-instance/databases/breaks_main" \
+            2>&1 || true
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -input=false \
+            -var="gcp_project_id=${{ secrets.GCP_PROJECT_ID }}" \
+            -var="gcp_region=${{ env.GCP_REGION }}" \
+            -var="jwt_secret=${{ secrets.JWT_SECRET }}" \
+            -var="smtp_host=${{ secrets.SMTP_HOST }}" \
+            -var="smtp_user=${{ secrets.SMTP_USER }}" \
+            -var="smtp_pass=${{ secrets.SMTP_PASS }}" \
+            -var="email_from=${{ secrets.SMTP_USER }}" \
+            -var="github_app_private_key_b64=${{ secrets.GH_APP_PRIVATE_KEY_B64 }}" \
+            -var="internal_api_secret=${{ secrets.INTERNAL_API_SECRET }}" \
+            -var="cloud_run_image=gcr.io/${{ secrets.GCP_PROJECT_ID }}/breaks-app:${{ github.sha }}" \
+            -out=tfplan
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 5
+
+      - name: Comment PR with Plan
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform\n
+            ${process.env.PLAN}
+            \`\`\`
+            
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+              
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [build, terraform-plan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/prod'
+    environment: 
+      name: ${{ github.ref == 'refs/heads/prod' && 'production' || 'development' }}
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Load database config
+        run: |
+          TF_VAR_databases=$(python3 -c "
+          import yaml, json
+          with open('databases.yml') as f:
+              data = yaml.safe_load(f)
+          print(json.dumps(data.get('databases') or {}))
+          ")
+          echo "TF_VAR_databases=$TF_VAR_databases" >> $GITHUB_ENV
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false tfplan
+        env:
+          TF_VAR_cloud_run_image: "gcr.io/${{ secrets.GCP_PROJECT_ID }}/breaks-app:${{ github.sha }}"
+
+      - name: Activate provisioned organizations
+        # After terraform apply creates each new database + credentials, call the
+        # internal endpoint to flip any matching pending orgs to active.
+        # The INTERNAL_API_SECRET is read from GitHub Secrets (same value stored in
+        # GCP Secret Manager and injected into Cloud Run as an env var).
+        run: |
+          SERVICE_URL=$(gcloud run services describe breaks-app \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --format="value(status.url)" 2>/dev/null)
+
+          # Activate each org that was just provisioned via databases.yml
+          python3 -c "
+          import yaml
+          with open('databases.yml') as f:
+              data = yaml.safe_load(f)
+          for key in data.get('databases', {}).keys():
+              print(key)
+          " | while read ORG_KEY; do
+            echo "Activating org: $ORG_KEY"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST "$SERVICE_URL/api/auth/internal/activate-org" \
+              -H "Authorization: Bearer ${{ secrets.INTERNAL_API_SECRET }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"orgKey\":\"$ORG_KEY\"}")
+            echo "  → HTTP $STATUS"
+          done
+
+      - name: Terraform Output
+        id: output
+        run: terraform output -json > terraform-outputs.json
+
+      - name: Upload Outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: ${{ env.TF_WORKING_DIR }}/terraform-outputs.json
+          retention-days: 30
